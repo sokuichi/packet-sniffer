@@ -26,6 +26,9 @@ except ImportError:
 
 logging.basicConfig(filename='netlog.db', level=logging.INFO, format='%(message)s')
 
+# Use at your own caution, Please dont run this without a vpn/vm
+# Educational purposes only
+
 # ====================== CONFIG ======================
 MAX_PACKETS_IN_MEMORY = 1000
 PACKET_SAVE_THRESHOLD = 600
