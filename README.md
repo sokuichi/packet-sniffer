@@ -1,2 +1,4 @@
 # packet-sniffer
-very very very very noobish packet-sniffer
+
+Use at your own caution lul
+Be a good boy when using
