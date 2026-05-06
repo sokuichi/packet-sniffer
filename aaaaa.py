@@ -26,6 +26,9 @@ except ImportError:
 
 logging.basicConfig(filename='netlog.db', level=logging.INFO, format='%(message)s')
 
+# made by __.__.___.__._0 on discord
+# is very begineer-level
+
 # ====================== CONFIG ======================
 MAX_PACKETS_IN_MEMORY = 1000
 PACKET_SAVE_THRESHOLD = 600
