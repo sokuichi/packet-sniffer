@@ -8,4 +8,3 @@ You have to set it up by yourself
 
 良いVPNを用意しておいた方がいいよ
 
-For the lulz
