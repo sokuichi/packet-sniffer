@@ -14,6 +14,7 @@ from tkinter import scrolledtext, messagebox, ttk, simpledialog
 from collections import defaultdict
 import queue
 import getpass
+import re
 
 try:
     from scapy.all import sniff, IP, TCP, UDP, Raw, conf, wrpcap, ARP
@@ -26,18 +27,22 @@ except ImportError:
 
 logging.basicConfig(filename='netlog.db', level=logging.INFO, format='%(message)s')
 
-# made by __.__.___.__._0 on discord
-# is very begineer-level
-
 # ====================== CONFIG ======================
 MAX_PACKETS_IN_MEMORY = 1000
 PACKET_SAVE_THRESHOLD = 600
 ALERT_COOLDOWN = 5
-PORT_SCAN_THRESHOLD = 20
-PORT_SCAN_WINDOW = 12
+PORT_SCAN_THRESHOLD = 15
+PORT_SCAN_WINDOW = 10
 MAX_TRACKED_IPS = 300
-LIVE_TRAFFIC_THROTTLE = 12
-CLEANUP_INTERVAL = 50
+LIVE_TRAFFIC_THROTTLE = 15
+CLEANUP_INTERVAL = 60
+
+# Improved sensitive data detection (context-aware)
+SENSITIVE_PATTERNS = [
+    re.compile(r'(password|passwd|pwd|login)=?["\']?[^"\']{4,}', re.I),
+    re.compile(r'(token|api_key|secret|bearer|jwt|refresh_token|privatekey|secretkey)=?["\']?[A-Za-z0-9_\-\.]{10,}', re.I),
+    re.compile(r'(credit.?card|cvv|ssn|pin|bank|cardnumber)=?["\']?\d', re.I),
+]
 
 
 class NetworkSniffer:
@@ -49,26 +54,21 @@ class NetworkSniffer:
         self.alerts = []
         self.alert_queue = queue.Queue()
 
-        self.keywords = {'password', 'passwd', 'login', 'token', 'auth', 'api_key', 'secret', 'private',
-                        'bearer', 'session', 'key', 'credential', 'credit', 'card', 'ssn', 'pin', 'bank',
-                        'admin', 'root', 'vpn', 'oauth', '2fa', 'mfa', 'jwt', 'refresh_token', 'apikey',
-                        'privatekey', 'secretkey'}
+        self.suspicious_ips = defaultdict(int)
+        self.port_scan_tracker = defaultdict(list)
+        self.last_alert_time = defaultdict(float)
 
         self.capture_file = 'capture.pcap'
         self.encrypted_log = 'secure_netlog.enc'
         self.key_file = '.key_secure'
         self.salt_file = '.salt_secure'
-
         self.cipher = None
         self.gui = None
-        self.suspicious_ips = defaultdict(int)
-        self.port_scan_tracker = defaultdict(list)
-        self.last_alert_time = defaultdict(float)
-        self.bpf_filter = "tcp or udp"
-        self.live_counter = 0
+
+        self.bpf_filter = "tcp or udp or arp"
         self.packet_counter = 0
         self.max_retries = 12
-        self.version = "2.1"
+        self.version = "2.2"
 
         self.load_or_create_key()
 
@@ -78,36 +78,46 @@ class NetworkSniffer:
             try:
                 with open(self.salt_file, 'rb') as f:
                     return f.read()
-            except Exception:
+            except:
                 pass
         salt = os.urandom(32)
         try:
             with open(self.salt_file, 'wb') as f:
                 f.write(salt)
-        except Exception:
+        except:
             pass
         return salt
 
     def load_or_create_key(self):
         salt = self.generate_secure_salt()
-        try:
-            if os.path.exists(self.key_file):
+        if os.path.exists(self.key_file):
+            try:
                 with open(self.key_file, 'rb') as f:
                     self.key = f.read()
                 self.cipher = Fernet(self.key)
-            else:
-                password = getpass.getpass("Enter master password for encryption: ")
-                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=650000)
-                derived = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-                self.key = derived
-                self.cipher = Fernet(derived)
-                with open(self.key_file, 'wb') as f:
-                    f.write(derived)
+                return
+            except Exception as e:
+                print(f"[!] Corrupted key file: {e}")
+
+        # First-time setup
+        print("[*] First-time setup - Creating master encryption key")
+        while True:
+            password = getpass.getpass("Create master password (min 8 chars): ")
+            if len(password) >= 8:
+                break
+            print("Password too short.")
+
+        try:
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=650000)
+            derived = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            self.key = derived
+            self.cipher = Fernet(derived)
+            with open(self.key_file, 'wb') as f:
+                f.write(derived)
+            print("[+] Master encryption key created successfully.")
         except Exception as e:
-            print(f"[!] Key setup warning: {e}. Using fallback.")
-            fallback = hashlib.sha256(salt + os.urandom(48)).digest()
-            self.key = base64.urlsafe_b64encode(fallback)
-            self.cipher = Fernet(self.key)
+            print(f"[!] Key creation failed: {e}")
+            sys.exit(1)
 
     def change_key(self):
         try:
@@ -126,110 +136,83 @@ class NetworkSniffer:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to change key: {e}")
 
-    def encrypt_data(self, data):
-        try:
-            return self.cipher.encrypt(data.encode('utf-8'))
-        except Exception:
-            return base64.b64encode(data.encode('utf-8'))
-
-    def secure_log(self, message):
-        try:
-            enc = self.encrypt_data(message)
-            with open(self.encrypted_log, 'ab') as f:
-                f.write(enc + b'\n')
-        except Exception:
-            pass
-
-    # ==================== UTILITIES ====================
-    def get_interfaces(self):
-        try:
-            return list(conf.ifaces.keys())
-        except Exception:
-            return ['eth0', 'wlan0', 'en0', 'Wi-Fi', 'Ethernet']
-
-    def interface_exists(self, iface):
-        return iface in self.get_interfaces()
-
-    def auto_select_interface(self):
-        for iface in self.get_interfaces():
-            try:
-                sniff(iface=iface, count=1, timeout=1, store=False)
-                return iface
-            except Exception:
-                continue
-        return self.get_interfaces()[0] if self.get_interfaces() else None
-
-    def should_rate_limit_alert(self, alert_type):
-        now = time.time()
-        if now - self.last_alert_time[alert_type] < ALERT_COOLDOWN:
-            return True
-        self.last_alert_time[alert_type] = now
+    # ==================== DETECTION ====================
+    def is_sensitive_data(self, payload: str) -> bool:
+        for pattern in SENSITIVE_PATTERNS:
+            if pattern.search(payload):
+                return True
         return False
 
-    def clean_old_tracking_data(self):
-        now = time.time()
-        for ip in list(self.port_scan_tracker.keys()):
-            self.port_scan_tracker[ip] = [p for p in self.port_scan_tracker[ip] if now - p[1] < PORT_SCAN_WINDOW]
-            if not self.port_scan_tracker[ip]:
-                self.port_scan_tracker.pop(ip, None)
-        if len(self.suspicious_ips) > MAX_TRACKED_IPS:
-            self.suspicious_ips = defaultdict(int, dict(sorted(self.suspicious_ips.items(), key=lambda x: x[1], reverse=True)[:MAX_TRACKED_IPS]))
-
-    def process_payload(self, raw_load):
-        try:
-            return raw_load.decode('utf-8', errors='ignore').lower()
-        except Exception:
-            return str(raw_load)[:400].lower()
-
-    # ==================== CORE LOGIC ====================
-    def detect_intrusion(self, packet, src, dst):
-        sensitive_found = False
-        if Raw in packet:
-            try:
-                payload_lower = self.process_payload(packet[Raw].load)
-                for kw in self.keywords:
-                    if kw in payload_lower:
-                        ts = datetime.datetime.now().strftime('%H:%M:%S')
-                        msg = f"SENSITIVE|{ts}|{src}->{dst}|{kw}"
-                        logging.info(msg)
-                        self.secure_log(msg)
-                        sensitive_found = True
-                        break
-            except Exception:
-                pass
-
-        if TCP in packet:
-            dport = packet[TCP].dport
-            self.port_scan_tracker[src].append((dport, time.time()))
-            recent = [p for p in self.port_scan_tracker[src] if time.time() - p[1] < PORT_SCAN_WINDOW]
-            if len(recent) > PORT_SCAN_THRESHOLD:
-                if not self.should_rate_limit_alert("portscan"):
-                    self.alert_queue.put(("HIGH", f"PORT SCAN from {src}"))
-
-        if ARP in packet and packet[ARP].op == 1:
-            if not self.should_rate_limit_alert("arp"):
-                self.alert_queue.put(("LOW", f"ARP Request from {src}"))
-
-        if sensitive_found and not self.should_rate_limit_alert("sensitive"):
-            self.alert_queue.put(("CRITICAL", f"SENSITIVE DATA | {src} → {dst}"))
-
-    def packet_handler(self, packet):
-        if not self.running or IP not in packet:
+    def detect_intrusion(self, packet):
+        if IP not in packet:
             return
 
         src = packet[IP].src
         dst = packet[IP].dst
+        alert_level = None
+        alert_msg = ""
+
+        # Improved Port Scan Detection (SYN only)
+        if TCP in packet and (packet[TCP].flags & 0x02):  # SYN flag
+            self.port_scan_tracker[src].append((packet[TCP].dport, time.time()))
+            recent = [p for p in self.port_scan_tracker[src] 
+                      if time.time() - p[1] < PORT_SCAN_WINDOW]
+
+            if len(recent) > PORT_SCAN_THRESHOLD:
+                if time.time() - self.last_alert_time["portscan"] > ALERT_COOLDOWN:
+                    self.last_alert_time["portscan"] = time.time()
+                    alert_level = "HIGH"
+                    alert_msg = f"PORT SCAN from {src} ({len(recent)} SYN packets)"
+
+        # Sensitive Data Detection
+        if Raw in packet:
+            try:
+                payload = packet[Raw].load.decode('utf-8', errors='ignore')
+                if self.is_sensitive_data(payload):
+                    if time.time() - self.last_alert_time["sensitive"] > ALERT_COOLDOWN:
+                        self.last_alert_time["sensitive"] = time.time()
+                        alert_level = "CRITICAL"
+                        alert_msg = f"SENSITIVE DATA | {src} → {dst}"
+                        self._secure_log(f"SENSITIVE|{datetime.datetime.now().strftime('%H:%M:%S')}|{src}->{dst}")
+            except:
+                pass
+
+        # ARP - Reduced noise
+        if ARP in packet and packet[ARP].op == 1:
+            if len(self.port_scan_tracker.get(src, [])) > 12:
+                if time.time() - self.last_alert_time["arp"] > ALERT_COOLDOWN * 3:
+                    self.last_alert_time["arp"] = time.time()
+                    alert_level = "MEDIUM"
+                    alert_msg = f"Suspicious ARP activity from {src}"
+
+        if alert_level and alert_msg:
+            self.alert_queue.put((alert_level, alert_msg))
+
+    def _secure_log(self, message: str):
+        try:
+            enc = self.cipher.encrypt(message.encode('utf-8'))
+            with open(self.encrypted_log, 'ab') as f:
+                f.write(enc + b'\n')
+        except:
+            pass
+
+    # ==================== PACKET HANDLER ====================
+    def packet_handler(self, packet):
+        if not self.running or IP not in packet:
+            return
+
         self.packet_counter += 1
+        src = packet[IP].src
+        dst = packet[IP].dst
 
         with self.lock:
             self.stats['total'] += 1
             self.packets.append(packet)
-
             if len(self.packets) > MAX_PACKETS_IN_MEMORY:
                 try:
                     wrpcap(self.capture_file, self.packets[-PACKET_SAVE_THRESHOLD:], append=True)
                     self.packets = self.packets[-500:]
-                except Exception:
+                except:
                     pass
 
             if TCP in packet:
@@ -237,34 +220,57 @@ class NetworkSniffer:
             elif UDP in packet:
                 self.stats['udp'] += 1
 
-        self.detect_intrusion(packet, src, dst)
+        self.detect_intrusion(packet)
 
-        # Periodic cleanup
         if self.packet_counter % CLEANUP_INTERVAL == 0:
             self.clean_old_tracking_data()
 
-        # Live Traffic (throttled + no redundant keyword check)
+        # Live Traffic (throttled)
         if self.gui and self.packet_counter % LIVE_TRAFFIC_THROTTLE == 0:
             try:
-                payload_preview = ""
+                preview = ""
                 if Raw in packet:
-                    payload_preview = self.process_payload(packet[Raw].load)[:100]
-                entry = f"{datetime.datetime.now().strftime('%H:%M:%S')} | {src:15} → {dst:15} | {payload_preview}\n"
+                    preview = packet[Raw].load.decode('utf-8', errors='ignore')[:100]
+                entry = f"{datetime.datetime.now().strftime('%H:%M:%S')} | {src:15} → {dst:15} | {preview}\n"
                 self.gui.update_live_traffic(entry)
-            except Exception:
+            except:
                 pass
 
+    def clean_old_tracking_data(self):
+        now = time.time()
+        for ip in list(self.port_scan_tracker.keys()):
+            self.port_scan_tracker[ip] = [p for p in self.port_scan_tracker[ip] if now - p[1] < PORT_SCAN_WINDOW]
+            if not self.port_scan_tracker[ip]:
+                self.port_scan_tracker.pop(ip, None)
+
+    # ==================== UTILITIES ====================
+    def get_interfaces(self):
+        try:
+            return list(conf.ifaces.keys())
+        except:
+            return ['eth0', 'wlan0', 'en0', 'Wi-Fi', 'Ethernet']
+
+    def auto_select_interface(self):
+        for iface in self.get_interfaces():
+            try:
+                sniff(iface=iface, count=1, timeout=1, store=False)
+                return iface
+            except:
+                continue
+        return self.get_interfaces()[0] if self.get_interfaces() else None
+
+    # ==================== THREADS & CONTROL ====================
     def stats_reporter(self):
         while self.running:
             time.sleep(7)
-            with self.lock:
-                if self.gui and self.stats['total'] > 0:
-                    stats_str = (f"Total Packets     : {self.stats['total']:,}\n"
-                                f"TCP Packets       : {self.stats['tcp']:,}\n"
-                                f"UDP Packets       : {self.stats['udp']:,}\n"
-                                f"Alerts Generated  : {len(self.alerts)}\n"
-                                f"Tracked IPs       : {len(self.suspicious_ips)}")
+            if self.gui:
+                try:
+                    stats_str = (f"Total Packets : {self.stats['total']:,}\n"
+                                 f"TCP : {self.stats['tcp']:,} | UDP : {self.stats['udp']:,}\n"
+                                 f"Alerts : {len(self.alerts)}")
                     self.gui.update_stats(stats_str)
+                except:
+                    pass
 
     def gui_updater(self):
         while self.running:
@@ -275,7 +281,7 @@ class NetworkSniffer:
                     if self.gui:
                         self.gui.log_alert(level, alert)
                 time.sleep(0.1)
-            except Exception:
+            except:
                 time.sleep(0.5)
 
     def retry_sniff(self, iface, filter_str, timeout):
@@ -283,9 +289,6 @@ class NetworkSniffer:
             if not self.running:
                 return
             try:
-                if not self.interface_exists(iface):
-                    print(f"[!] Interface {iface} not found.")
-                    return
                 print(f"[*] Starting capture on {iface} | Filter: {filter_str}")
                 sniff(iface=iface, filter=filter_str, prn=self.packet_handler, store=False,
                       timeout=timeout if timeout > 0 else None,
@@ -302,7 +305,7 @@ class NetworkSniffer:
         try:
             if self.packets:
                 wrpcap(self.capture_file, self.packets, append=True)
-        except Exception:
+        except:
             pass
         sys.exit(0)
 
@@ -323,15 +326,6 @@ class NetworkSniffer:
         if args.list:
             for iface in self.get_interfaces():
                 print(iface)
-            return
-
-        if args.daemon:
-            logging.getLogger().setLevel(logging.WARNING)
-            signal.signal(signal.SIGINT, self.stop)
-            signal.signal(signal.SIGTERM, self.stop)
-            threading.Thread(target=self.stats_reporter, daemon=True).start()
-            iface = args.iface or self.auto_select_interface() or self.get_interfaces()[0]
-            self.retry_sniff(iface, self.bpf_filter, args.time)
             return
 
         self.gui = SnifferGUI(self, self.version)
@@ -361,7 +355,6 @@ class SnifferGUI:
         tab1 = ttk.Frame(notebook)
         tab2 = ttk.Frame(notebook)
         tab3 = ttk.Frame(notebook)
-
         notebook.add(tab1, text="Live Traffic")
         notebook.add(tab2, text="Alerts & IDS")
         notebook.add(tab3, text="Statistics")
@@ -418,18 +411,20 @@ class SnifferGUI:
 
     def export_alerts(self):
         try:
-            with open("alerts_export.txt", "w") as f:
+            with open("alerts_export.txt", "w", encoding="utf-8") as f:
                 f.write(self.alert_text.get(1.0, tk.END))
             messagebox.showinfo("Exported", "Alerts exported to alerts_export.txt")
         except Exception as e:
             messagebox.showerror("Error", f"Export failed: {e}")
 
 
+# ====================== MAIN ======================
 if os.geteuid() != 0 and sys.platform != "win32":
     try:
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
-    except Exception:
+    except:
         pass
 
-sniffer = NetworkSniffer()
-sniffer.run()
+if __name__ == "__main__":
+    sniffer = NetworkSniffer()
+    sniffer.run()
